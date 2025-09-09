@@ -3,6 +3,7 @@
 This document defines each column emitted by the CLI. Use it as a reference when filtering or joining data.
 
 ## Core columns
+
 - source_package
   - The input (target) package name.
 - source_version
@@ -29,6 +30,7 @@ This document defines each column emitted by the CLI. Use it as a reference when
   - Error message if row-level processing failed (e.g., network/packument issues).
 
 ## Blast-radius columns
+
 - compromised_published_at
   - Publish timestamp of `source_version` in the source package timeline.
 - dependent_version_published_at
@@ -45,6 +47,7 @@ This document defines each column emitted by the CLI. Use it as a reference when
   - True if `dependent_version_range` is an exact version and equals `source_version`.
 
 ## Notes
+
 - Timestamps are ISO strings from the npm registry time map.
 - Range checks include prereleases (includePrerelease=true).
 - Actual installs depend on lockfiles; these fields are heuristics derived from publish times and semver.

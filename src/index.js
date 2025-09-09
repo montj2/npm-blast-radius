@@ -1,66 +1,79 @@
 #!/usr/bin/env node
 import 'dotenv/config';
-import { readFile, writeFile, stat } from 'node:fs/promises';
+import { stat } from 'node:fs/promises';
 import { createReadStream, createWriteStream } from 'node:fs';
 import { resolve } from 'node:path';
 import { setTimeout as delay } from 'node:timers/promises';
+import { setTimeout as setNodeTimeout, clearTimeout as clearNodeTimeout } from 'node:timers';
 import Papa from 'papaparse';
 import pLimit from 'p-limit';
 import semver from 'semver';
 import { fetch } from 'undici';
+import { Command } from 'commander';
+import { createRequire } from 'node:module';
+const require = createRequire(import.meta.url);
+const pkg = require('../package.json');
 
 const DEFAULT_CONCURRENCY = Number(process.env.CONCURRENCY || 8);
 const NPM_REGISTRY = process.env.NPM_REGISTRY || 'https://registry.npmjs.org';
 const NPM_SEARCH_URL = process.env.NPM_SEARCH_URL || 'https://api.npms.io/v2/search';
+const DEFAULT_TIMEOUT_MS = Number(process.env.HTTP_TIMEOUT_MS || 15000);
 
 function parseArgs(argv) {
-  const args = {
-    input: null,
-    output: 'dependents.csv',
-    maxDependents: 0,
-    concurrency: DEFAULT_CONCURRENCY,
-  includeDev: false,
-  includePeer: true,
-  append: false,
-  progress: 25,
-  quiet: false,
-  verbose: false,
-  noLibraries: false,
-  noScrape: false,
-  };
-  for (let i = 2; i < argv.length; i++) {
-    const a = argv[i];
-    if (a === '-i' || a === '--input') args.input = argv[++i];
-    else if (a === '-o' || a === '--output') args.output = argv[++i];
-    else if (a === '--max') args.maxDependents = Number(argv[++i]);
-    else if (a === '-c' || a === '--concurrency') args.concurrency = Number(argv[++i]);
-  else if (a === '--include-dev') args.includeDev = true;
-  else if (a === '--no-peer') args.includePeer = false;
-  else if (a === '--append') args.append = true;
-  else if (a === '--progress') args.progress = Number(argv[++i]) || args.progress;
-  else if (a === '--quiet') args.quiet = true;
-  else if (a === '--verbose') args.verbose = true;
-  else if (a === '--no-libraries') args.noLibraries = true;
-  else if (a === '--no-scrape') args.noScrape = true;
-    else if (a === '-h' || a === '--help') {
-      printHelp();
-      process.exit(0);
-    } else {
-      console.error(`Unknown arg: ${a}`);
-      printHelp();
-      process.exit(1);
-    }
-  }
-  if (!args.input) {
-    console.error('Missing --input <file>');
-    printHelp();
-    process.exit(1);
-  }
-  return args;
-}
+  const program = new Command();
+  program
+    .name('npm-blast-radius')
+    .description(
+      'Map the blast radius of compromised npm packages (direct dependents, attribution, and timing signals).',
+    )
+    .version(pkg.version || '0.0.0');
 
-function printHelp() {
-  console.log(`Usage: npm-blast-radius -i input.csv [-o output.csv] [--max N] [-c N] [--include-dev] [--no-peer] [--append] [--progress N] [--quiet] [--verbose] [--no-libraries] [--no-scrape]\n\nInput CSV columns (header required):\n  package,version\n\nOutput CSV columns:\n  See docs/data-dictionary.md for the complete list and definitions.\n\nFlags:\n  --include-dev     include devDependencies when attributing usage (off by default)\n  --no-peer         exclude peerDependencies (included by default)\n  --append          append to output file (skip header if file exists)\n  --progress N      log every N dependents processed (default 25)\n  --quiet           minimal logging\n  --verbose         extra diagnostics about discovery sources (npms.io vs libraries.io vs scrape)\n  --no-libraries    disable Libraries.io fallback\n  --no-scrape       disable npm website scraping fallback\n`);
+  program.requiredOption('-i, --input <file>', 'input CSV (columns: package,version)');
+  program.option('-o, --output <file>', 'output CSV path', 'dependents.csv');
+  program.option('--max <n>', 'cap dependents per source package', (v) => Number(v), 0);
+  program.option(
+    '-c, --concurrency <n>',
+    'concurrent HTTP requests',
+    (v) => Number(v),
+    DEFAULT_CONCURRENCY,
+  );
+  program.option('--include-dev', 'include devDependencies when attributing usage', false);
+  program.option('--no-peer', 'exclude peerDependencies (included by default)');
+  program.option('--append', 'append to output (skip header if file exists)', false);
+  program.option('--progress <n>', 'log every N dependents processed', (v) => Number(v), 25);
+  program.option('--quiet', 'minimal logging', false);
+  program.option('--verbose', 'extra diagnostics about discovery sources', false);
+  program.option('--no-libraries', 'disable Libraries.io fallback', false);
+  program.option('--no-scrape', 'disable npm website scraping fallback', false);
+  program.option(
+    '--timeout <ms>',
+    'HTTP request timeout in milliseconds',
+    (v) => Number(v),
+    DEFAULT_TIMEOUT_MS,
+  );
+
+  program.addHelpText(
+    'after',
+    `\nOutput CSV columns:\n  See docs/data-dictionary.md for the complete list and definitions.\n`,
+  );
+
+  program.parse(argv);
+  const opts = program.opts();
+  // Normalize option names to existing code expectations
+  return {
+    input: opts.input,
+    output: opts.output,
+    maxDependents: opts.max,
+    concurrency: opts.concurrency,
+    includeDev: !!opts.includeDev,
+    includePeer: opts.peer !== false, // commander sets opts.peer when using --no-peer
+    append: !!opts.append,
+    progress: opts.progress,
+    quiet: !!opts.quiet,
+    verbose: !!opts.verbose,
+    noLibraries: !!opts.noLibraries,
+    noScrape: !!opts.noScrape,
+  };
 }
 
 async function readInput(file) {
@@ -82,22 +95,35 @@ async function readInput(file) {
   });
 }
 
-async function fetchJSON(url, options = {}, retries = 3) {
+async function fetchJSON(url, options = {}, retries = 3, timeoutMs = DEFAULT_TIMEOUT_MS) {
   for (let attempt = 0; attempt <= retries; attempt++) {
+    const ac = new globalThis.AbortController();
+    const to = setNodeTimeout(() => ac.abort(), Math.max(1000, timeoutMs));
     const isRegistry = url.startsWith(NPM_REGISTRY);
     const authHeaders = {};
     if (isRegistry && process.env.NPM_TOKEN) {
       authHeaders['authorization'] = `Bearer ${process.env.NPM_TOKEN}`;
     }
-    const res = await fetch(url, {
-      ...options,
-      headers: {
-  'user-agent': 'npm-blast-radius/0.1 (+https://www.npmjs.com)',
-        'accept': 'application/json',
-        ...authHeaders,
-        ...(options.headers || {}),
-      },
-    });
+    let res;
+    try {
+      res = await fetch(url, {
+        ...options,
+        signal: ac.signal,
+        headers: {
+          'user-agent': `npm-blast-radius/${pkg.version || '0.0.0'} (+https://www.npmjs.com)`,
+          accept: 'application/json',
+          ...authHeaders,
+          ...(options.headers || {}),
+        },
+      });
+    } catch (e) {
+      clearNodeTimeout(to);
+      if (attempt === retries) throw new Error(`Fetch error for ${url}: ${e?.message || e}`);
+      await delay((attempt + 1) * 500);
+      continue;
+    } finally {
+      clearNodeTimeout(to);
+    }
 
     if (res.status === 429) {
       const wait = Number(res.headers.get('retry-after')) || Math.min(60, 2 ** attempt * 2);
@@ -121,9 +147,9 @@ function encodePkg(name) {
   return name.startsWith('@') ? name.replace('/', '%2F') : name;
 }
 
-async function getPackageMetadata(name) {
+async function getPackageMetadata(name, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const url = `${NPM_REGISTRY}/${encodePkg(name)}`;
-  return fetchJSON(url);
+  return fetchJSON(url, {}, 3, timeoutMs);
 }
 
 function extractLastUpdate(pkgMeta) {
@@ -156,7 +182,10 @@ function listVersionDatesFromTimeMap(timeMap) {
   const seen = new Set();
   const dedup = [];
   for (const it of out) {
-    if (!seen.has(it.version)) { seen.add(it.version); dedup.push(it); }
+    if (!seen.has(it.version)) {
+      seen.add(it.version);
+      dedup.push(it);
+    }
   }
   // Sort ascending by date
   dedup.sort((a, b) => a.date - b.date);
@@ -165,9 +194,7 @@ function listVersionDatesFromTimeMap(timeMap) {
 
 function maxSatisfyingAtOrBefore(versionDates, range, atDate) {
   if (!range || !atDate) return null;
-  const candidates = versionDates
-    .filter(vd => vd.date <= atDate)
-    .map(vd => vd.version);
+  const candidates = versionDates.filter((vd) => vd.date <= atDate).map((vd) => vd.version);
   if (candidates.length === 0) return null;
   try {
     return semver.maxSatisfying(candidates, range, { includePrerelease: true }) || null;
@@ -206,8 +233,15 @@ function listDependentsQuery(name, from, qualifier = 'dependencies') {
   return url;
 }
 
-async function fetchAllDependents(name, includeDev = false, includePeer = true, max = 0, verbose = false, options = {}) {
-  const { noLibraries = false, noScrape = false } = options || {};
+async function fetchAllDependents(
+  name,
+  includeDev = false,
+  includePeer = true,
+  max = 0,
+  verbose = false,
+  options = {},
+) {
+  const { noLibraries = false, noScrape = false, timeoutMs = DEFAULT_TIMEOUT_MS } = options || {};
   // Query npms.io for dependencies, and optionally devDependencies and peerDependencies
   const qualifiers = ['dependencies'];
   if (includeDev) qualifiers.push('devDependencies');
@@ -221,13 +255,16 @@ async function fetchAllDependents(name, includeDev = false, includePeer = true, 
       const url = listDependentsQuery(name, from, qualifier);
       let data;
       try {
-        data = await fetchJSON(url);
+        data = await fetchJSON(url, {}, 3, timeoutMs);
       } catch (e) {
         if (verbose) console.warn(`[${name}] npms.io ${qualifier} fetch error: ${e?.message || e}`);
         break;
       }
       const results = data?.results || [];
-      if (verbose) console.log(`[${name}] npms.io ${qualifier} total=${data?.total ?? 'unknown'} from=${from} got=${results.length}`);
+      if (verbose)
+        console.log(
+          `[${name}] npms.io ${qualifier} total=${data?.total ?? 'unknown'} from=${from} got=${results.length}`,
+        );
       if (results.length === 0) break;
       let addedThisPage = 0;
       for (const r of results) {
@@ -242,7 +279,8 @@ async function fetchAllDependents(name, includeDev = false, includePeer = true, 
       }
       stats.npms += addedThisPage;
       from += results.length;
-      if (from >= Math.min(data.total || Infinity, max || Infinity) || (max && seen.size >= max)) break;
+      if (from >= Math.min(data.total || Infinity, max || Infinity) || (max && seen.size >= max))
+        break;
       await delay(150);
     }
   }
@@ -250,7 +288,7 @@ async function fetchAllDependents(name, includeDev = false, includePeer = true, 
   if (!noLibraries && (seen.size === 0 || (max && seen.size < max))) {
     const remaining = max ? Math.max(0, max - seen.size) : 0;
     try {
-      const more = await fetchDependentsFromLibrariesIO(name, remaining);
+      const more = await fetchDependentsFromLibrariesIO(name, remaining, timeoutMs);
       let added = 0;
       for (const pkg of more) {
         if (!seen.has(pkg)) {
@@ -261,15 +299,18 @@ async function fetchAllDependents(name, includeDev = false, includePeer = true, 
         if (max && seen.size >= max) break;
       }
       stats.libraries += added;
-    if (verbose) console.log(`[${name}] libraries.io added ${added} (requested up to ${remaining || 'all'})`);
+      if (verbose)
+        console.log(
+          `[${name}] libraries.io added ${added} (requested up to ${remaining || 'all'})`,
+        );
     } catch (e) {
-    if (verbose) console.warn(`[${name}] libraries.io fetch error: ${e?.message || e}`);
+      if (verbose) console.warn(`[${name}] libraries.io fetch error: ${e?.message || e}`);
     }
   }
   // Fallback: scrape npm website dependents page if still empty/insufficient
   if (!noScrape && (seen.size === 0 || (max && seen.size < max))) {
     const remaining = max ? Math.max(0, max - seen.size) : 0;
-    const more = await fetchDependentsFromNpmWebsite(name, remaining || 500);
+    const more = await fetchDependentsFromNpmWebsite(name, remaining || 500, timeoutMs);
     let added = 0;
     for (const pkg of more) {
       if (!seen.has(pkg)) {
@@ -280,12 +321,13 @@ async function fetchAllDependents(name, includeDev = false, includePeer = true, 
       if (max && seen.size >= max) break;
     }
     stats.scraped += added;
-    if (verbose) console.log(`[${name}] scraped added ${added} (requested up to ${remaining || 'all'})`);
+    if (verbose)
+      console.log(`[${name}] scraped added ${added} (requested up to ${remaining || 'all'})`);
   }
   return { names: Array.from(seen.keys()), stats, sources: sourceByPkg };
 }
 
-async function fetchDependentsFromLibrariesIO(name, max = 0) {
+async function fetchDependentsFromLibrariesIO(name, max = 0, timeoutMs = DEFAULT_TIMEOUT_MS) {
   const apiKey = process.env.LIBRARIES_IO_API_KEY;
   if (!apiKey) return [];
   const perPage = 100;
@@ -293,7 +335,7 @@ async function fetchDependentsFromLibrariesIO(name, max = 0) {
   for (let page = 1; page < 1000; page++) {
     if (max && out.length >= max) break;
     const base = `https://libraries.io/api/npm/${encodeURIComponent(name)}/dependents?api_key=${encodeURIComponent(apiKey)}&per_page=${perPage}&page=${page}`;
-    const data = await fetchJSON(base);
+    const data = await fetchJSON(base, {}, 3, timeoutMs);
     if (!Array.isArray(data)) {
       // Likely disabled: { message: "Disabled for performance reasons" }
       if (data && typeof data === 'object' && data.message) {
@@ -312,7 +354,7 @@ async function fetchDependentsFromLibrariesIO(name, max = 0) {
   return out;
 }
 
-async function fetchDependentsFromNpmWebsite(name, max = 0) {
+async function fetchDependentsFromNpmWebsite(name, max = 0, timeoutMs = DEFAULT_TIMEOUT_MS) {
   // Scrape https://www.npmjs.com/browse/depended/<name>?offset=<n>
   // We'll extract hrefs matching /package/<pkg>
   const results = new Set();
@@ -320,13 +362,13 @@ async function fetchDependentsFromNpmWebsite(name, max = 0) {
   for (let offset = 0; offset < 50000; offset += pageSize) {
     if (max && results.size >= max) break;
     const url = `https://www.npmjs.com/browse/depended/${encodeURIComponent(name)}?offset=${offset}`;
-    const html = await fetchText(url);
+    const html = await fetchText(url, 3, timeoutMs);
     if (!html) break;
     const beforeCount = results.size;
-    const re = /href=\"\/package\/([^\"?#]+)\"/g;
+    const re = /href="\/package\/([^"?#]+)"/g;
     let m;
     while ((m = re.exec(html)) !== null) {
-      let pkg = decodeURIComponent(m[1]);
+      const pkg = decodeURIComponent(m[1]);
       // skip the package itself and non-npm links
       if (!pkg || pkg === name) continue;
       // Exclude anchors like /package/ in header navigation if any present by filtering obvious names
@@ -340,14 +382,29 @@ async function fetchDependentsFromNpmWebsite(name, max = 0) {
   return Array.from(results);
 }
 
-async function fetchText(url, retries = 3) {
+async function fetchText(url, retries = 3, timeoutMs = DEFAULT_TIMEOUT_MS) {
   for (let attempt = 0; attempt <= retries; attempt++) {
-    const res = await fetch(url, {
-      headers: {
-        'user-agent': 'npm-blast-radius/0.1 (+https://www.npmjs.com)',
-        'accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
-      },
-    });
+    const ac = new globalThis.AbortController();
+    const to = setNodeTimeout(() => ac.abort(), Math.max(1000, timeoutMs));
+    let res;
+    try {
+      res = await fetch(url, {
+        signal: ac.signal,
+        headers: {
+          'user-agent': `npm-blast-radius/${pkg.version || '0.0.0'} (+https://www.npmjs.com)`,
+          accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+        },
+      });
+    } catch (e) {
+      clearNodeTimeout(to);
+      if (attempt === retries) {
+        return '';
+      }
+      await delay((attempt + 1) * 500);
+      continue;
+    } finally {
+      clearNodeTimeout(to);
+    }
     if (res.status === 429) {
       const wait = Number(res.headers.get('retry-after')) || Math.min(60, 2 ** attempt * 2);
       await delay(wait * 1000);
@@ -366,23 +423,75 @@ function findDependencyRange(pkgMeta, targetName, includeDev = false, includePee
 
   // First try the latest version
   if (latest) {
-    if (latest.dependencies?.[targetName]) return { range: latest.dependencies[targetName], latestVersion: latestTag || null, isDev: false, dependencyType: 'dep', matchedVersion: latestTag || '' };
-    if (includePeer && latest.peerDependencies?.[targetName]) return { range: latest.peerDependencies[targetName], latestVersion: latestTag || null, isDev: false, dependencyType: 'peer', matchedVersion: latestTag || '' };
-    if (includeDev && latest.devDependencies?.[targetName]) return { range: latest.devDependencies[targetName], latestVersion: latestTag || null, isDev: true, dependencyType: 'dev', matchedVersion: latestTag || '' };
+    if (latest.dependencies?.[targetName])
+      return {
+        range: latest.dependencies[targetName],
+        latestVersion: latestTag || null,
+        isDev: false,
+        dependencyType: 'dep',
+        matchedVersion: latestTag || '',
+      };
+    if (includePeer && latest.peerDependencies?.[targetName])
+      return {
+        range: latest.peerDependencies[targetName],
+        latestVersion: latestTag || null,
+        isDev: false,
+        dependencyType: 'peer',
+        matchedVersion: latestTag || '',
+      };
+    if (includeDev && latest.devDependencies?.[targetName])
+      return {
+        range: latest.devDependencies[targetName],
+        latestVersion: latestTag || null,
+        isDev: true,
+        dependencyType: 'dev',
+        matchedVersion: latestTag || '',
+      };
   }
 
   // Fallback: scan historical versions from newest to oldest
   const allVersionKeys = Object.keys(versions).sort((a, b) => {
-    try { return semver.rcompare(semver.coerce(a), semver.coerce(b)); } catch { return 0; }
+    try {
+      return semver.rcompare(semver.coerce(a), semver.coerce(b));
+    } catch {
+      return 0;
+    }
   });
   for (const v of allVersionKeys) {
     const man = versions[v];
     if (!man) continue;
-    if (man.dependencies?.[targetName]) return { range: man.dependencies[targetName], latestVersion: latestTag || null, isDev: false, dependencyType: 'dep', matchedVersion: v };
-    if (includePeer && man.peerDependencies?.[targetName]) return { range: man.peerDependencies[targetName], latestVersion: latestTag || null, isDev: false, dependencyType: 'peer', matchedVersion: v };
-    if (includeDev && man.devDependencies?.[targetName]) return { range: man.devDependencies[targetName], latestVersion: latestTag || null, isDev: true, dependencyType: 'dev', matchedVersion: v };
+    if (man.dependencies?.[targetName])
+      return {
+        range: man.dependencies[targetName],
+        latestVersion: latestTag || null,
+        isDev: false,
+        dependencyType: 'dep',
+        matchedVersion: v,
+      };
+    if (includePeer && man.peerDependencies?.[targetName])
+      return {
+        range: man.peerDependencies[targetName],
+        latestVersion: latestTag || null,
+        isDev: false,
+        dependencyType: 'peer',
+        matchedVersion: v,
+      };
+    if (includeDev && man.devDependencies?.[targetName])
+      return {
+        range: man.devDependencies[targetName],
+        latestVersion: latestTag || null,
+        isDev: true,
+        dependencyType: 'dev',
+        matchedVersion: v,
+      };
   }
-  return { range: null, latestVersion: latestTag || null, isDev: false, dependencyType: null, matchedVersion: '' };
+  return {
+    range: null,
+    latestVersion: latestTag || null,
+    isDev: false,
+    dependencyType: null,
+    matchedVersion: '',
+  };
 }
 
 function satisfies(version, range) {
@@ -394,96 +503,130 @@ function satisfies(version, range) {
   }
 }
 
-async function processPackage(targetName, targetVersion, includeDev, includePeer, limit, maxDependents, onRow, args) {
+async function processPackage(
+  targetName,
+  targetVersion,
+  includeDev,
+  includePeer,
+  limit,
+  maxDependents,
+  onRow,
+  args,
+) {
   if (!args.quiet) console.log(`[${targetName}] discovering dependents…`);
   // Fetch target package metadata once for blast-radius computations
   let targetMeta = null;
   try {
-    targetMeta = await getPackageMetadata(targetName);
+    targetMeta = await getPackageMetadata(targetName, args.timeout);
   } catch (e) {
-    if (!args.quiet) console.warn(`[${targetName}] failed to fetch target metadata: ${e?.message || e}`);
+    if (!args.quiet)
+      console.warn(`[${targetName}] failed to fetch target metadata: ${e?.message || e}`);
   }
   const targetTimeMap = targetMeta?.time || null;
   const targetVersionDates = listVersionDatesFromTimeMap(targetTimeMap);
-  const targetAllVersions = targetVersionDates.map(v => v.version);
+  const targetAllVersions = targetVersionDates.map((v) => v.version);
   const compromisedVersion = targetVersion || '';
-  const compromisedPublishedAt = compromisedVersion && targetTimeMap ? (targetTimeMap[compromisedVersion] || '') : '';
+  const compromisedPublishedAt =
+    compromisedVersion && targetTimeMap ? targetTimeMap[compromisedVersion] || '' : '';
 
-  const { names: dependents, stats, sources } = await fetchAllDependents(targetName, includeDev, includePeer, maxDependents, args.verbose, { noLibraries: args.noLibraries, noScrape: args.noScrape });
-  if (!args.quiet) console.log(`[${targetName}] found ${dependents.length} dependents (npms:${stats.npms}, libraries:${stats.libraries}, scraped:${stats.scraped})`);
+  const {
+    names: dependents,
+    stats,
+    sources,
+  } = await fetchAllDependents(targetName, includeDev, includePeer, maxDependents, args.verbose, {
+    noLibraries: args.noLibraries,
+    noScrape: args.noScrape,
+    timeoutMs: args.timeout,
+  });
+  if (!args.quiet)
+    console.log(
+      `[${targetName}] found ${dependents.length} dependents (npms:${stats.npms}, libraries:${stats.libraries}, scraped:${stats.scraped})`,
+    );
   await Promise.all(
-    dependents.map((depName, idx) => limit(async () => {
-      try {
-        const meta = await getPackageMetadata(depName);
-        const { range, latestVersion, isDev, dependencyType, matchedVersion } = findDependencyRange(meta, targetName, includeDev, includePeer);
-        const lastUpdate = extractLastUpdate(meta);
-        // Determine dependent version publish date
-        const depTime = meta?.time || {};
-        const depVersionToUse = matchedVersion || latestVersion || '';
-        const dependentPublishedAt = depVersionToUse ? (depTime[depVersionToUse] || '') : '';
+    dependents.map((depName, idx) =>
+      limit(async () => {
+        try {
+          const meta = await getPackageMetadata(depName, args.timeout);
+          const { range, latestVersion, isDev, dependencyType, matchedVersion } =
+            findDependencyRange(meta, targetName, includeDev, includePeer);
+          const lastUpdate = extractLastUpdate(meta);
+          // Determine dependent version publish date
+          const depTime = meta?.time || {};
+          const depVersionToUse = matchedVersion || latestVersion || '';
+          const dependentPublishedAt = depVersionToUse ? depTime[depVersionToUse] || '' : '';
 
-        // Blast-radius calculations
-        const rangeIncludesCompromised = range ? satisfies(compromisedVersion, range) : false;
-        const resolvedAtRelease = (range && depVersionToUse && targetVersionDates.length > 0)
-          ? maxSatisfyingAtOrBefore(targetVersionDates, range, toDateSafe(dependentPublishedAt))
-          : null;
-        const resolvedNow = (range && targetAllVersions.length > 0)
-          ? maxSatisfyingNow(targetAllVersions, range)
-          : null;
-        const likelyImpactedAtRelease = !!(resolvedAtRelease && compromisedVersion && semver.eq(semver.coerce(resolvedAtRelease), semver.coerce(compromisedVersion)));
-        const stillImpactedNow = !!(resolvedNow && compromisedVersion && semver.eq(semver.coerce(resolvedNow), semver.coerce(compromisedVersion)));
-        const exactPin = isExactPin(range, compromisedVersion);
-  onRow({
-          source_package: targetName,
-          source_version: targetVersion || '',
-          dependent: depName,
-          dependent_version_range: range || '',
-          dependent_latest_version: latestVersion || '',
-          last_update: lastUpdate || '',
-          dependent_matched_version: matchedVersion || '',
-          dependency_type: dependencyType || '',
-          is_dev_dependency: isDev,
-          source_version_satisfies: range ? satisfies(targetVersion, range) : false,
-          dependent_source: sources?.get(depName) || '',
-          compromised_published_at: compromisedPublishedAt || '',
-          dependent_version_published_at: dependentPublishedAt || '',
-          resolved_at_dependent_release: resolvedAtRelease || '',
-          resolved_now: resolvedNow || '',
-          likely_impacted_at_release: likelyImpactedAtRelease,
-          still_impacted_now: stillImpactedNow,
-          uses_exact_pin: exactPin,
-  });
-      } catch (e) {
-  onRow({
-          source_package: targetName,
-          source_version: targetVersion || '',
-          dependent: depName,
-          dependent_version_range: '',
-          dependent_latest_version: '',
-          last_update: '',
-          dependent_matched_version: '',
-          dependency_type: '',
-          is_dev_dependency: false,
-          source_version_satisfies: false,
-          error: String(e?.message || e),
-          dependent_source: sources?.get(depName) || '',
-          compromised_published_at: '',
-          dependent_version_published_at: '',
-          resolved_at_dependent_release: '',
-          resolved_now: '',
-          likely_impacted_at_release: false,
-          still_impacted_now: false,
-          uses_exact_pin: false,
-  });
-      }
-      if (!args.quiet) {
-        const processed = idx + 1;
-        if (processed % (args.progress || 25) === 0 || processed === dependents.length) {
-          console.log(`[${targetName}] processed ${processed}/${dependents.length}`);
+          // Blast-radius calculations
+          const resolvedAtRelease =
+            range && depVersionToUse && targetVersionDates.length > 0
+              ? maxSatisfyingAtOrBefore(targetVersionDates, range, toDateSafe(dependentPublishedAt))
+              : null;
+          const resolvedNow =
+            range && targetAllVersions.length > 0
+              ? maxSatisfyingNow(targetAllVersions, range)
+              : null;
+          const likelyImpactedAtRelease = !!(
+            resolvedAtRelease &&
+            compromisedVersion &&
+            semver.eq(semver.coerce(resolvedAtRelease), semver.coerce(compromisedVersion))
+          );
+          const stillImpactedNow = !!(
+            resolvedNow &&
+            compromisedVersion &&
+            semver.eq(semver.coerce(resolvedNow), semver.coerce(compromisedVersion))
+          );
+          const exactPin = isExactPin(range, compromisedVersion);
+          onRow({
+            source_package: targetName,
+            source_version: targetVersion || '',
+            dependent: depName,
+            dependent_version_range: range || '',
+            dependent_latest_version: latestVersion || '',
+            last_update: lastUpdate || '',
+            dependent_matched_version: matchedVersion || '',
+            dependency_type: dependencyType || '',
+            is_dev_dependency: isDev,
+            source_version_satisfies: range ? satisfies(targetVersion, range) : false,
+            dependent_source: sources?.get(depName) || '',
+            compromised_published_at: compromisedPublishedAt || '',
+            dependent_version_published_at: dependentPublishedAt || '',
+            resolved_at_dependent_release: resolvedAtRelease || '',
+            resolved_now: resolvedNow || '',
+            likely_impacted_at_release: likelyImpactedAtRelease,
+            still_impacted_now: stillImpactedNow,
+            uses_exact_pin: exactPin,
+          });
+        } catch (e) {
+          onRow({
+            source_package: targetName,
+            source_version: targetVersion || '',
+            dependent: depName,
+            dependent_version_range: '',
+            dependent_latest_version: '',
+            last_update: '',
+            dependent_matched_version: '',
+            dependency_type: '',
+            is_dev_dependency: false,
+            source_version_satisfies: false,
+            error: String(e?.message || e),
+            dependent_source: sources?.get(depName) || '',
+            compromised_published_at: '',
+            dependent_version_published_at: '',
+            resolved_at_dependent_release: '',
+            resolved_now: '',
+            likely_impacted_at_release: false,
+            still_impacted_now: false,
+            uses_exact_pin: false,
+          });
         }
-      }
-      await delay(50);
-    }))
+        if (!args.quiet) {
+          const processed = idx + 1;
+          if (processed % (args.progress || 25) === 0 || processed === dependents.length) {
+            console.log(`[${targetName}] processed ${processed}/${dependents.length}`);
+          }
+        }
+        await delay(50);
+      }),
+    ),
   );
 }
 
@@ -503,14 +646,14 @@ async function main() {
     'dependency_type',
     'is_dev_dependency',
     'source_version_satisfies',
-  'dependent_source',
-  'compromised_published_at',
-  'dependent_version_published_at',
-  'resolved_at_dependent_release',
-  'resolved_now',
-  'likely_impacted_at_release',
-  'still_impacted_now',
-  'uses_exact_pin',
+    'dependent_source',
+    'compromised_published_at',
+    'dependent_version_published_at',
+    'resolved_at_dependent_release',
+    'resolved_now',
+    'likely_impacted_at_release',
+    'still_impacted_now',
+    'uses_exact_pin',
     'error',
   ];
   const outPath = resolve(process.cwd(), args.output);
@@ -523,7 +666,16 @@ async function main() {
   };
 
   for (const row of inputRows) {
-    await processPackage(row.package, row.version, args.includeDev, args.includePeer, limit, args.maxDependents, onRow, args);
+    await processPackage(
+      row.package,
+      row.version,
+      args.includeDev,
+      args.includePeer,
+      limit,
+      args.maxDependents,
+      onRow,
+      args,
+    );
   }
 
   await new Promise((res) => stream.end(res));
@@ -535,7 +687,9 @@ async function openCsvWriter(outPath, fields, append = false) {
   try {
     const s = await stat(outPath);
     fileExists = s.size > 0;
-  } catch {}
+  } catch (_e) {
+    // ignore stat errors (file does not exist yet)
+  }
   const stream = createWriteStream(outPath, { flags: append ? 'a' : 'w' });
   let wroteHeader = false;
   if (!append || !fileExists) {
@@ -546,9 +700,8 @@ async function openCsvWriter(outPath, fields, append = false) {
   return { stream, wroteHeader };
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
-  main().catch((e) => {
-    console.error(e);
-    process.exit(1);
-  });
-}
+// Execute CLI unconditionally. This file is intended as a bin entry point, not a library.
+main().catch((e) => {
+  console.error(e);
+  process.exit(1);
+});
