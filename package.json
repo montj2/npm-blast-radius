@@ -42,6 +42,9 @@
     "README.md",
     "docs"
   ],
+  "publishConfig": {
+    "access": "public"
+  },
   "dependencies": {
     "commander": "^12.1.0",
     "date-fns": "^3.6.0",
