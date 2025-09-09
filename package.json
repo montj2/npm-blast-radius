@@ -1,0 +1,26 @@
+{
+  "name": "npm-blast-radius",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Map the blast radius of compromised npm packages",
+  "bin": {
+    "npm-blast-radius": "src/index.js"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "lint": "echo 'No linter configured'",
+    "test": "node src/index.js --help"
+  },
+  "engines": {
+    "node": ">=18.0.0"
+  },
+  "dependencies": {
+    "date-fns": "^3.6.0",
+    "dotenv": "^16.4.5",
+    "p-limit": "^6.1.0",
+    "papaparse": "^5.4.1",
+    "semver": "^7.6.3",
+    "undici": "^6.19.8"
+  }
+}
